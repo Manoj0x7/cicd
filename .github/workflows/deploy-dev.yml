@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+
   workflow_dispatch:
 
 permissions:
@@ -18,37 +19,67 @@ env:
 
 jobs:
   deploy:
+    name: Deploy to DEV
     runs-on: ubuntu-latest
 
     steps:
+
+      # --------------------------------------------------
+      # 1. Checkout source code
+      # --------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
+      # --------------------------------------------------
+      # 2. Authenticate to Google Cloud using OIDC
+      # --------------------------------------------------
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: projects/293444534887/locations/global/workloadIdentityPools/github-actions/providers/github
           service_account: github-actions-deployer@project-b7883a1e-3510-4a94-981.iam.gserviceaccount.com
 
+      # --------------------------------------------------
+      # 3. Configure gcloud
+      # --------------------------------------------------
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v3
         with:
           project_id: ${{ env.PROJECT_ID }}
 
+      # --------------------------------------------------
+      # 4. Create deployment artifact
+      #
+      # IMPORTANT:
+      # The archive is created in /tmp, NOT inside the
+      # repository directory being archived.
+      # --------------------------------------------------
       - name: Create deployment archive
         run: |
+          set -euo pipefail
+
           RELEASE="${GITHUB_SHA::7}"
+
+          echo "Release: ${RELEASE}"
 
           tar \
             --exclude='.git' \
             --exclude='.github' \
-            -czf "site-${RELEASE}.tar.gz" \
+            -czf "/tmp/site-${RELEASE}.tar.gz" \
             .
+
+          echo "Archive created:"
+          ls -lh "/tmp/site-${RELEASE}.tar.gz"
 
           echo "RELEASE=${RELEASE}" >> "$GITHUB_ENV"
 
+      # --------------------------------------------------
+      # 5. Generate temporary SSH key
+      # --------------------------------------------------
       - name: Generate ephemeral SSH key
         run: |
+          set -euo pipefail
+
           mkdir -p "$HOME/.ssh"
 
           ssh-keygen \
@@ -56,14 +87,26 @@ jobs:
             -f "$HOME/.ssh/gcp_deploy" \
             -N ""
 
+          chmod 600 "$HOME/.ssh/gcp_deploy"
+
+      # --------------------------------------------------
+      # 6. Publish temporary SSH key to OS Login
+      # --------------------------------------------------
       - name: Publish SSH key to OS Login
         run: |
+          set -euo pipefail
+
           gcloud compute os-login ssh-keys add \
             --key-file="$HOME/.ssh/gcp_deploy.pub" \
             --ttl=30m
 
+      # --------------------------------------------------
+      # 7. Start IAP TCP tunnel
+      # --------------------------------------------------
       - name: Start IAP tunnel
         run: |
+          set -euo pipefail
+
           gcloud compute start-iap-tunnel \
             "$VM_NAME" \
             22 \
@@ -73,51 +116,105 @@ jobs:
 
           echo $! > /tmp/iap-tunnel.pid
 
+          echo "Waiting for IAP tunnel..."
+
           sleep 5
 
           cat /tmp/iap-tunnel.log
 
+      # --------------------------------------------------
+      # 8. Verify SSH connectivity
+      # --------------------------------------------------
+      - name: Test SSH connection
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i "$HOME/.ssh/gcp_deploy" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=15 \
+            -p 2222 \
+            "${OS_LOGIN_USERNAME}@127.0.0.1" \
+            "hostname && echo SSH_SUCCESS"
+
+      # --------------------------------------------------
+      # 9. Upload deployment artifact
+      # --------------------------------------------------
       - name: Upload release
         run: |
+          set -euo pipefail
+
           scp \
             -i "$HOME/.ssh/gcp_deploy" \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=15 \
             -P 2222 \
-            "site-${RELEASE}.tar.gz" \
+            "/tmp/site-${RELEASE}.tar.gz" \
             "${OS_LOGIN_USERNAME}@127.0.0.1:/tmp/site-${RELEASE}.tar.gz"
 
+      # --------------------------------------------------
+      # 10. Deploy using the root-owned deployment helper
+      # --------------------------------------------------
       - name: Deploy release
         run: |
+          set -euo pipefail
+
           ssh \
             -i "$HOME/.ssh/gcp_deploy" \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=15 \
             -p 2222 \
             "${OS_LOGIN_USERNAME}@127.0.0.1" \
             "sudo /usr/local/lib/cicd/deploy-site.sh ${RELEASE}"
 
+      # --------------------------------------------------
+      # 11. Verify deployment
+      # --------------------------------------------------
       - name: Verify deployment
         run: |
+          set -euo pipefail
+
           ssh \
             -i "$HOME/.ssh/gcp_deploy" \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=15 \
             -p 2222 \
             "${OS_LOGIN_USERNAME}@127.0.0.1" \
-            "readlink -f /var/www/site/current && curl -fsS http://127.0.0.1/"
+            "echo 'Current release:' && \
+             readlink -f /var/www/site/current && \
+             echo 'Application response:' && \
+             curl -fsS http://127.0.0.1/"
 
+      # --------------------------------------------------
+      # 12. Cleanup
+      #
+      # Always runs, even if deployment fails.
+      # --------------------------------------------------
       - name: Cleanup
         if: always()
         run: |
+          set +e
+
+          echo "Stopping IAP tunnel..."
+
           if [ -f /tmp/iap-tunnel.pid ]; then
-            kill "$(cat /tmp/iap-tunnel.pid)" || true
+            kill "$(cat /tmp/iap-tunnel.pid)" 2>/dev/null || true
           fi
+
+          echo "Removing ephemeral OS Login SSH key..."
 
           if [ -f "$HOME/.ssh/gcp_deploy.pub" ]; then
             gcloud compute os-login ssh-keys remove \
-              --key-file="$HOME/.ssh/gcp_deploy.pub" || true
+              --key-file="$HOME/.ssh/gcp_deploy.pub" \
+              || true
           fi
+
+          echo "Cleanup complete."
