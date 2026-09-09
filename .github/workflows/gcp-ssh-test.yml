@@ -28,7 +28,10 @@ jobs:
 
       - name: Generate ephemeral SSH key
         run: |
-          ssh-keygen -t rsa -b 3072 -f "$HOME/.ssh/gcp_deploy" -N ""
+          mkdir -p "$HOME/.ssh"
+          ssh-keygen -t ed25519 \
+            -f "$HOME/.ssh/gcp_deploy" \
+            -N ""
 
       - name: Publish SSH key to OS Login
         run: |
@@ -40,20 +43,43 @@ jobs:
         run: |
           USERNAME="$(gcloud compute os-login describe-profile \
             --format='value(posixAccounts[0].username)')"
+
           echo "OS_LOGIN_USERNAME=$USERNAME" >> "$GITHUB_ENV"
+
           echo "OS Login username: $USERNAME"
+
+      - name: Start IAP tunnel
+        run: |
+          gcloud compute start-iap-tunnel cicd-dev 22 \
+            --local-host-port=localhost:2222 \
+            --zone=asia-south1-c \
+            > /tmp/iap-tunnel.log 2>&1 &
+
+          echo $! > /tmp/iap-tunnel.pid
+
+          sleep 5
+
+          cat /tmp/iap-tunnel.log
 
       - name: Test SSH through IAP
         run: |
-          gcloud compute ssh "cicd-dev" \
-            --zone="asia-south1-c" \
-            --tunnel-through-iap \
-            --ssh-key-file="$HOME/.ssh/gcp_deploy" \
-            --ssh-flag="-o IdentitiesOnly=yes" \
-            --command="hostname"
+          ssh \
+            -i "$HOME/.ssh/gcp_deploy" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=15 \
+            -p 2222 \
+            "$OS_LOGIN_USERNAME@127.0.0.1" \
+            "hostname && echo SSH_SUCCESS"
 
-      - name: Remove SSH key
+      - name: Cleanup
         if: always()
         run: |
+          if [ -f /tmp/iap-tunnel.pid ]; then
+            kill "$(cat /tmp/iap-tunnel.pid)" || true
+          fi
+
           gcloud compute os-login ssh-keys remove \
             --key-file="$HOME/.ssh/gcp_deploy.pub" || true
+
