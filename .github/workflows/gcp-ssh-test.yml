@@ -1,0 +1,59 @@
+name: GCP IAP SSH Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  ssh-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: projects/293444534887/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: github-actions-deployer@project-b7883a1e-3510-4a94-981.iam.gserviceaccount.com
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: project-b7883a1e-3510-4a94-981
+
+      - name: Generate ephemeral SSH key
+        run: |
+          ssh-keygen -t rsa -b 3072 -f "$HOME/.ssh/gcp_deploy" -N ""
+
+      - name: Publish SSH key to OS Login
+        run: |
+          gcloud compute os-login ssh-keys add \
+            --key-file="$HOME/.ssh/gcp_deploy.pub" \
+            --ttl=30m
+
+      - name: Get OS Login username
+        run: |
+          USERNAME="$(gcloud compute os-login describe-profile \
+            --format='value(posixAccounts[0].username)')"
+          echo "OS_LOGIN_USERNAME=$USERNAME" >> "$GITHUB_ENV"
+          echo "OS Login username: $USERNAME"
+
+      - name: Test SSH through IAP
+        run: |
+          gcloud compute ssh "cicd-dev" \
+            --zone="asia-south1-c" \
+            --tunnel-through-iap \
+            --ssh-key-file="$HOME/.ssh/gcp_deploy" \
+            --ssh-flag="-o IdentitiesOnly=yes" \
+            --command="hostname"
+
+      - name: Remove SSH key
+        if: always()
+        run: |
+          gcloud compute os-login ssh-keys remove \
+            --key-file="$HOME/.ssh/gcp_deploy.pub" || true
