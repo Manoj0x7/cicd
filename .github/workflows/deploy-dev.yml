@@ -1,0 +1,123 @@
+name: Deploy DEV
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: project-b7883a1e-3510-4a94-981
+  ZONE: asia-south1-c
+  VM_NAME: cicd-dev
+  OS_LOGIN_USERNAME: sa_111328390378067479395
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: projects/293444534887/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: github-actions-deployer@project-b7883a1e-3510-4a94-981.iam.gserviceaccount.com
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Create deployment archive
+        run: |
+          RELEASE="${GITHUB_SHA::7}"
+
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            -czf "site-${RELEASE}.tar.gz" \
+            .
+
+          echo "RELEASE=${RELEASE}" >> "$GITHUB_ENV"
+
+      - name: Generate ephemeral SSH key
+        run: |
+          mkdir -p "$HOME/.ssh"
+
+          ssh-keygen \
+            -t ed25519 \
+            -f "$HOME/.ssh/gcp_deploy" \
+            -N ""
+
+      - name: Publish SSH key to OS Login
+        run: |
+          gcloud compute os-login ssh-keys add \
+            --key-file="$HOME/.ssh/gcp_deploy.pub" \
+            --ttl=30m
+
+      - name: Start IAP tunnel
+        run: |
+          gcloud compute start-iap-tunnel \
+            "$VM_NAME" \
+            22 \
+            --local-host-port=localhost:2222 \
+            --zone="$ZONE" \
+            > /tmp/iap-tunnel.log 2>&1 &
+
+          echo $! > /tmp/iap-tunnel.pid
+
+          sleep 5
+
+          cat /tmp/iap-tunnel.log
+
+      - name: Upload release
+        run: |
+          scp \
+            -i "$HOME/.ssh/gcp_deploy" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -P 2222 \
+            "site-${RELEASE}.tar.gz" \
+            "${OS_LOGIN_USERNAME}@127.0.0.1:/tmp/site-${RELEASE}.tar.gz"
+
+      - name: Deploy release
+        run: |
+          ssh \
+            -i "$HOME/.ssh/gcp_deploy" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            "${OS_LOGIN_USERNAME}@127.0.0.1" \
+            "sudo /usr/local/lib/cicd/deploy-site.sh ${RELEASE}"
+
+      - name: Verify deployment
+        run: |
+          ssh \
+            -i "$HOME/.ssh/gcp_deploy" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            "${OS_LOGIN_USERNAME}@127.0.0.1" \
+            "readlink -f /var/www/site/current && curl -fsS http://127.0.0.1/"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f /tmp/iap-tunnel.pid ]; then
+            kill "$(cat /tmp/iap-tunnel.pid)" || true
+          fi
+
+          if [ -f "$HOME/.ssh/gcp_deploy.pub" ]; then
+            gcloud compute os-login ssh-keys remove \
+              --key-file="$HOME/.ssh/gcp_deploy.pub" || true
+          fi
