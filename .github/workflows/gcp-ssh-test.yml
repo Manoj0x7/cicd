@@ -7,6 +7,15 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
+  WIF_POOL: ${{ vars.GCP_WIF_POOL }}
+  WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+  SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+  ZONE: ${{ vars.GCP_ZONE }}
+  VM_NAME: ${{ vars.GCP_VM_NAME }}
+
 jobs:
   ssh-test:
     runs-on: ubuntu-latest
@@ -18,41 +27,60 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
-          workload_identity_provider: projects/293444534887/locations/global/workloadIdentityPools/github-actions/providers/github
-          service_account: github-actions-deployer@project-b7883a1e-3510-4a94-981.iam.gserviceaccount.com
+          workload_identity_provider: >-
+            projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
 
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v3
         with:
-          project_id: project-b7883a1e-3510-4a94-981
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Get OS Login username
+        run: |
+          set -euo pipefail
+
+          USERNAME="$(gcloud compute os-login describe-profile \
+            --format='value(posixAccounts[0].username)')"
+
+          if [ -z "$USERNAME" ]; then
+            echo "ERROR: Could not determine OS Login username"
+            exit 1
+          fi
+
+          echo "OS_LOGIN_USERNAME=$USERNAME" >> "$GITHUB_ENV"
+          echo "OS Login username: $USERNAME"
 
       - name: Generate ephemeral SSH key
         run: |
+          set -euo pipefail
+
           mkdir -p "$HOME/.ssh"
-          ssh-keygen -t ed25519 \
+
+          ssh-keygen \
+            -t ed25519 \
             -f "$HOME/.ssh/gcp_deploy" \
             -N ""
 
+          chmod 600 "$HOME/.ssh/gcp_deploy"
+
       - name: Publish SSH key to OS Login
         run: |
+          set -euo pipefail
+
           gcloud compute os-login ssh-keys add \
             --key-file="$HOME/.ssh/gcp_deploy.pub" \
             --ttl=30m
 
-      - name: Get OS Login username
-        run: |
-          USERNAME="$(gcloud compute os-login describe-profile \
-            --format='value(posixAccounts[0].username)')"
-
-          echo "OS_LOGIN_USERNAME=$USERNAME" >> "$GITHUB_ENV"
-
-          echo "OS Login username: $USERNAME"
-
       - name: Start IAP tunnel
         run: |
-          gcloud compute start-iap-tunnel cicd-dev 22 \
+          set -euo pipefail
+
+          gcloud compute start-iap-tunnel \
+            "$VM_NAME" \
+            22 \
             --local-host-port=localhost:2222 \
-            --zone=asia-south1-c \
+            --zone="$ZONE" \
             > /tmp/iap-tunnel.log 2>&1 &
 
           echo $! > /tmp/iap-tunnel.pid
@@ -63,6 +91,8 @@ jobs:
 
       - name: Test SSH through IAP
         run: |
+          set -euo pipefail
+
           ssh \
             -i "$HOME/.ssh/gcp_deploy" \
             -o IdentitiesOnly=yes \
@@ -70,16 +100,20 @@ jobs:
             -o UserKnownHostsFile=/dev/null \
             -o ConnectTimeout=15 \
             -p 2222 \
-            "$OS_LOGIN_USERNAME@127.0.0.1" \
+            "${OS_LOGIN_USERNAME}@127.0.0.1" \
             "hostname && echo SSH_SUCCESS"
 
       - name: Cleanup
         if: always()
         run: |
+          set +e
+
           if [ -f /tmp/iap-tunnel.pid ]; then
-            kill "$(cat /tmp/iap-tunnel.pid)" || true
+            kill "$(cat /tmp/iap-tunnel.pid)" 2>/dev/null || true
           fi
 
-          gcloud compute os-login ssh-keys remove \
-            --key-file="$HOME/.ssh/gcp_deploy.pub" || true
-
+          if [ -f "$HOME/.ssh/gcp_deploy.pub" ]; then
+            gcloud compute os-login ssh-keys remove \
+              --key-file="$HOME/.ssh/gcp_deploy.pub" \
+              || true
+          fi
