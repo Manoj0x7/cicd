@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
@@ -12,10 +11,13 @@ permissions:
   id-token: write
 
 env:
-  PROJECT_ID: project-b7883a1e-3510-4a94-981
-  ZONE: asia-south1-c
-  VM_NAME: cicd-dev
-  OS_LOGIN_USERNAME: sa_111328390378067479395
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
+  WIF_POOL: ${{ vars.GCP_WIF_POOL }}
+  WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+  SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+  ZONE: ${{ vars.GCP_ZONE }}
+  VM_NAME: ${{ vars.GCP_VM_NAME }}
 
 jobs:
   deploy:
@@ -23,7 +25,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
       # --------------------------------------------------
       # 1. Checkout source code
       # --------------------------------------------------
@@ -31,13 +32,14 @@ jobs:
         uses: actions/checkout@v4
 
       # --------------------------------------------------
-      # 2. Authenticate to Google Cloud using OIDC
+      # 2. Authenticate to GCP using GitHub OIDC
       # --------------------------------------------------
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
-          workload_identity_provider: projects/293444534887/locations/global/workloadIdentityPools/github-actions/providers/github
-          service_account: github-actions-deployer@project-b7883a1e-3510-4a94-981.iam.gserviceaccount.com
+          workload_identity_provider: >-
+            projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
 
       # --------------------------------------------------
       # 3. Configure gcloud
@@ -48,11 +50,25 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
 
       # --------------------------------------------------
-      # 4. Create deployment artifact
-      #
-      # IMPORTANT:
-      # The archive is created in /tmp, NOT inside the
-      # repository directory being archived.
+      # 4. Dynamically get OS Login username
+      # --------------------------------------------------
+      - name: Get OS Login username
+        run: |
+          set -euo pipefail
+
+          USERNAME="$(gcloud compute os-login describe-profile \
+            --format='value(posixAccounts[0].username)')"
+
+          if [ -z "$USERNAME" ]; then
+            echo "ERROR: Could not determine OS Login username"
+            exit 1
+          fi
+
+          echo "OS_LOGIN_USERNAME=$USERNAME" >> "$GITHUB_ENV"
+          echo "OS Login username: $USERNAME"
+
+      # --------------------------------------------------
+      # 5. Create deployment artifact
       # --------------------------------------------------
       - name: Create deployment archive
         run: |
@@ -74,7 +90,7 @@ jobs:
           echo "RELEASE=${RELEASE}" >> "$GITHUB_ENV"
 
       # --------------------------------------------------
-      # 5. Generate temporary SSH key
+      # 6. Generate temporary SSH key
       # --------------------------------------------------
       - name: Generate ephemeral SSH key
         run: |
@@ -90,7 +106,7 @@ jobs:
           chmod 600 "$HOME/.ssh/gcp_deploy"
 
       # --------------------------------------------------
-      # 6. Publish temporary SSH key to OS Login
+      # 7. Publish SSH key to OS Login
       # --------------------------------------------------
       - name: Publish SSH key to OS Login
         run: |
@@ -101,7 +117,7 @@ jobs:
             --ttl=30m
 
       # --------------------------------------------------
-      # 7. Start IAP TCP tunnel
+      # 8. Start IAP tunnel
       # --------------------------------------------------
       - name: Start IAP tunnel
         run: |
@@ -117,13 +133,12 @@ jobs:
           echo $! > /tmp/iap-tunnel.pid
 
           echo "Waiting for IAP tunnel..."
-
           sleep 5
 
           cat /tmp/iap-tunnel.log
 
       # --------------------------------------------------
-      # 8. Verify SSH connectivity
+      # 9. Verify SSH connectivity
       # --------------------------------------------------
       - name: Test SSH connection
         run: |
@@ -140,7 +155,7 @@ jobs:
             "hostname && echo SSH_SUCCESS"
 
       # --------------------------------------------------
-      # 9. Upload deployment artifact
+      # 10. Upload artifact
       # --------------------------------------------------
       - name: Upload release
         run: |
@@ -157,7 +172,7 @@ jobs:
             "${OS_LOGIN_USERNAME}@127.0.0.1:/tmp/site-${RELEASE}.tar.gz"
 
       # --------------------------------------------------
-      # 10. Deploy using the root-owned deployment helper
+      # 11. Run deployment helper on VM
       # --------------------------------------------------
       - name: Deploy release
         run: |
@@ -174,7 +189,7 @@ jobs:
             "sudo /usr/local/lib/cicd/deploy-site.sh ${RELEASE}"
 
       # --------------------------------------------------
-      # 11. Verify deployment
+      # 12. Verify deployment
       # --------------------------------------------------
       - name: Verify deployment
         run: |
@@ -194,9 +209,7 @@ jobs:
              curl -fsS http://127.0.0.1/"
 
       # --------------------------------------------------
-      # 12. Cleanup
-      #
-      # Always runs, even if deployment fails.
+      # 13. Cleanup - always runs
       # --------------------------------------------------
       - name: Cleanup
         if: always()
