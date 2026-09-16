@@ -7,6 +7,13 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
+  WIF_POOL: ${{ vars.GCP_WIF_POOL }}
+  WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+  SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
 jobs:
   authenticate:
     runs-on: ubuntu-latest
@@ -18,15 +25,21 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
-          workload_identity_provider: projects/293444534887/locations/global/workloadIdentityPools/github-actions/providers/github
-          service_account: github-actions-deployer@project-b7883a1e-3510-4a94-981.iam.gserviceaccount.com
+          workload_identity_provider: >-
+            projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
 
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v3
         with:
-          project_id: project-b7883a1e-3510-4a94-981
+          project_id: ${{ env.PROJECT_ID }}
 
       - name: Verify authentication
         run: |
+          set -euo pipefail
+
+          echo "Authenticated accounts:"
           gcloud auth list
+
+          echo "Current project:"
           gcloud config get-value project
